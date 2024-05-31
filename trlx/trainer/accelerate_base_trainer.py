@@ -68,13 +68,15 @@ class AccelerateRLTrainer(BaseRLTrainer):
         self.scheduler = self.setup_scheduler()
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            config.tokenizer.tokenizer_path, **config.tokenizer.tokenizer_extra_configs
+            config.tokenizer.tokenizer_path, **config.tokenizer.tokenizer_extra_configs, trust_remote_code=True
         )
         self.tokenizer.padding_side = config.tokenizer.padding_side
         self.tokenizer.truncation_side = config.tokenizer.truncation_side
         self.tokenizer.sep_token = "<sep>"
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = "<|padding|>"
+        if self.tokenizer.pad_token is None or self.tokenizer.pad_token_id is None:
+            # self.tokenizer.pad_token = "<|padding|>"
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         script_name = os.path.basename(sys.argv[0]).rsplit(".", 1)[0]
         if not isinstance(config.model.model_path, str):
@@ -415,8 +417,12 @@ class AccelerateRLTrainer(BaseRLTrainer):
             if self.accelerator.is_main_process:
                 str_samples, str_prompts, str_outputs = self.decode(all_prompts, all_samples, all_prompt_sizes)
 
-                columns = ["prompt", "output"]
-                columns_data = [str_prompts, str_outputs]
+                # output lengths
+                output_lengths = torch.tensor([len(out) for out, prompt in zip(str_outputs, str_prompts)], dtype=torch.float)
+                stats["eval/output_length"] = torch.as_tensor(output_lengths).mean().item()
+
+                columns = ["prompt", "output", "length"]
+                columns_data = [str_prompts, str_outputs, output_lengths]
 
                 metadata, *xs = all_metadata
                 for k in metadata:
@@ -483,7 +489,7 @@ class AccelerateRLTrainer(BaseRLTrainer):
             # Add metrics/rewards to the table's title
             table_title = f"Evaluation #{self.nth_evaluation}"
             for k, x in stats.items():
-                if k.startswith("reward") or k.startswith("metrics"):
+                if k.startswith("reward") or k.startswith("metrics") or k.startswith("eval"):
                     table_title += f" {k}: {significant(x)}"
 
             rich_table = Table(*columns, title=table_title, show_lines=True)

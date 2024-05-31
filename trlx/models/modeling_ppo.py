@@ -1,3 +1,5 @@
+# replace trlx/models/modeling_ppo.py 
+
 import gc
 import inspect
 import re
@@ -13,6 +15,14 @@ from torchtyping import TensorType
 from transformers.modeling_outputs import ModelOutput
 from transformers.models.bloom import modeling_bloom
 from transformers.models.opt import modeling_opt
+from speechllm.replacement_scripts import modeling_falcon
+from transformers.models.mistral import modeling_mistral
+from transformers.modeling_outputs import CausalLMOutputWithPast, CausalLMOutputWithCrossAttentions
+from transformers.cache_utils import Cache, DynamicCache, StaticCache, SlidingWindowCache
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+from torch.nn import CrossEntropyLoss
+from loguru import logger
+
 
 from trlx.data.method_configs import MethodConfig, register_method
 from trlx.models.modeling_base import PreTrainedModelWrapper
@@ -311,6 +321,9 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
         forward_kwargs["output_hidden_states"] = True
         forward_kwargs["return_dict"] = True
 
+        forward_kwargs.pop("past_key_values", None)
+        forward_kwargs.pop("attention_mask", None)
+
         if self.peft_type == "PREFIX_TUNING":
             # In this case peft redefines past_key_values, remove it to avoid an exception.
             forward_kwargs.pop("past_key_values", None)
@@ -435,6 +448,8 @@ class AutoModelForCausalLMWithHydraValueHead(AutoModelForCausalLMWithValueHead):
         return_dict = forward_kwargs.get("return_dict", True)
         forward_kwargs["return_dict"] = True
         forward_kwargs["output_hidden_states"] = True
+        forward_kwargs.pop("past_key_values", None) # for falcon 
+        forward_kwargs.pop("attention_mask", None) # for Mistral 
 
         if self.peft_type:
             hydra_outputs = self.forward(**forward_kwargs, ignore_peft_adapter=True)
@@ -518,8 +533,10 @@ class ModelBranch(transformers.PreTrainedModel):
         """
         super().__init__(base_model.config)
 
+        # breakpoint() 
+        # self.transformer = base_model.transformer
+        # self.embed_tokens = base_model.model.embed_tokens
         # The branch is defined by the last `num_layers_unfrozen` layers of the pretrained model
-
         decoder_blocks = hf_get_decoder_blocks(base_model)[-num_layers_unfrozen:]
         final_norm = hf_get_decoder_final_norm(base_model)
         lm_head = hf_get_lm_head(base_model)
@@ -928,6 +945,311 @@ class BloomModelBranch(ModelBranch):
             attentions=all_self_attentions,
         )
 
+class FalconModelBranch(ModelBranch):
+
+    # reference: https://huggingface.co/tiiuae/falcon-7b-instruct/blob/main/modeling_falcon.py
+
+    def _prepare_attn_mask(
+        self, attention_mask: torch.Tensor, input_shape: Tuple[int, int], past_key_values_length: int
+    ) -> torch.BoolTensor:
+        # create causal mask
+        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
+        combined_attention_mask = None
+        device = attention_mask.device
+        _, src_length = input_shape
+
+        if src_length > 1:
+            combined_attention_mask = modeling_falcon._make_causal_mask(
+                input_shape, device=device, past_key_values_length=past_key_values_length
+            )
+
+        # [batch_size, seq_length] -> [batch_size, 1, tgt_length, src_length]
+        expanded_attn_mask = modeling_falcon._expand_mask(attention_mask, past_key_values_length=past_key_values_length)
+        combined_attention_mask = (
+            expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask | combined_attention_mask
+        )
+
+        return combined_attention_mask
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        output_shape: torch.Tensor,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = False,        
+    ): 
+        """
+        Reference: https://huggingface.co/tiiuae/falcon-7b-instruct/blob/main/modelling_RW.py
+        """
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        batch_size, seq_length = hidden_states.shape[:2]
+
+        if past_key_values is None:
+            past_key_values = tuple([None] * len(self.decoder_blocks))
+
+        head_mask = self.get_head_mask(head_mask, hf_get_num_hidden_layers(self.config))
+
+        presents = () if use_cache else None
+        all_self_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+
+        # Compute alibi tensor: check build_alibi_tensor documentation
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
+        if past_key_values[0] is not None:
+            past_key_values_length = past_key_values[0][0].shape[2]
+            seq_length_with_past = seq_length_with_past + past_key_values_length
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
+        else:
+            attention_mask = attention_mask.to(hidden_states.device)
+
+        alibi = modeling_falcon.build_alibi_tensor(attention_mask, self.config.num_attention_heads, dtype=hidden_states.dtype)
+
+        causal_mask = self._prepare_attn_mask(
+            attention_mask,
+            input_shape=(batch_size, seq_length),
+            past_key_values_length=past_key_values_length,
+        )
+
+        for i, (block, layer_past) in enumerate(zip(self.decoder_blocks, past_key_values)):
+
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+
+            if self.gradient_checkpointing and self.training:
+
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        # None for past_key_value
+                        return module(*inputs, use_cache=use_cache, output_attentions=output_attentions)
+
+                    return custom_forward
+
+                outputs = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    alibi,
+                    causal_mask,
+                    head_mask[i],
+                )
+            else:
+                outputs = block(
+                    hidden_states,
+                    layer_past=layer_past,
+                    attention_mask=causal_mask,
+                    head_mask=head_mask[i],
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    alibi=alibi,
+                )
+
+            hidden_states = outputs[0]
+            if use_cache is True:
+                presents = presents + (outputs[1],)
+
+            if output_attentions:
+                all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
+
+        # Add last hidden state
+        hidden_states = self.final_norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        lm_logits = self.lm_head(hidden_states)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
+
+        return CausalLMOutputWithValue(
+            logits=lm_logits,
+            past_key_values=presents,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attentions,
+        )
+
+class MistralModelBranch(ModelBranch): 
+
+    def _make_causal_mask(self, input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
+        """
+        Make causal mask used for bi-directional self-attention.
+        """
+        bsz, tgt_len = input_ids_shape
+        mask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min))
+        mask_cond = torch.arange(mask.size(-1))
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        mask = mask.to(dtype)
+
+        if past_key_values_length > 0:
+            mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype), mask], dim=-1)
+        return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+
+    def _expand_mask(self, mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
+        """
+        Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
+        """
+        bsz, src_len = mask.size()
+        tgt_len = tgt_len if tgt_len is not None else src_len
+
+        expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+
+        inverted_mask = 1.0 - expanded_mask
+
+        return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
+
+    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, hidden_states, past_key_values_length):
+        # create causal mask
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        combined_attention_mask = None
+        if input_shape[-1] > 1:
+            combined_attention_mask = self._make_causal_mask(
+                input_shape, hidden_states.dtype, past_key_values_length=past_key_values_length
+            ).to(hidden_states.device)
+
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            expanded_attn_mask = self._expand_mask(attention_mask, hidden_states.dtype, tgt_len=input_shape[-1]).to(
+                hidden_states.device
+            )
+            combined_attention_mask = (
+                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+            )
+        return combined_attention_mask
+
+    # reference: https://github.com/huggingface/transformers/blob/main/src/transformers/models/mistral/modeling_mistral.py
+    # _prepare_decoder_attention_mask, _make_causal_mask and _expand_mask are from LlamaModelBranch
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        output_shape: torch.Tensor,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = False,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        batch_size, seq_length = hidden_states.shape[:2]
+        seq_length_with_past = seq_length
+        past_key_values_length = 0
+
+        if past_key_values is not None:
+            past_key_values_length = past_key_values[0][0].shape[2]
+            seq_length_with_past = seq_length_with_past + past_key_values_length
+
+        if position_ids is None:
+            device = hidden_states.device if hidden_states is not None else encoder_hidden_states.device
+            position_ids = torch.arange(
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+        else:
+            position_ids = position_ids.view(-1, seq_length).long()
+
+        if self.gradient_checkpointing and self.training and use_cache:
+            logger.warning(
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+            )
+            use_cache = False
+
+        # embed positions
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
+            )
+
+        attention_mask =  self._prepare_decoder_attention_mask(
+            attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
+        )
+
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = None
+
+        for decoder_layer in self.decoder_blocks:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            if self.gradient_checkpointing and self.training:
+                layer_outputs = self._gradient_checkpointing_func(
+                    decoder_layer.__call__,
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    past_key_values,
+                    output_attentions,
+                    use_cache,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        hidden_states = self.final_norm(hidden_states)
+        hidden_states = hidden_states.view(output_shape)
+        lm_logits = self.lm_head(hidden_states)
+
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+
+        next_cache = next_decoder_cache if use_cache else None
+        if not return_dict:
+            outputs = (lm_logits,) + (None,) + (None,)
+            return outputs
+
+        return CausalLMOutputWithValue(
+            logits=lm_logits,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
 
 class LlamaModelBranch(ModelBranch):
     def _make_causal_mask(self, input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
@@ -1021,7 +1343,7 @@ class LlamaModelBranch(ModelBranch):
         # embed positions
         if attention_mask is None:
             attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device
+                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
             )
         attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
@@ -1609,6 +1931,8 @@ def hf_get_branch_class(
     bloom_branch_supported_archs = ["BloomModel", "BloomForCausalLM"]
     llama_branch_supported_archs = ["LlamaModel", "LlamaForCausalLM"]
     bigcode_branch_supported_archs = ["GPTBigCodeModel", "GPTBigCodeForCausalLM"]
+    falcon_archs = ["RWForCausalLM", "FalconForCausalLM"]
+    mistral_archs = ["MistralForCausalLM"]
     arch = config.architectures[0]
     if arch in gpt_branch_supported_archs:
         return GPTModelBranch
@@ -1620,6 +1944,11 @@ def hf_get_branch_class(
         return LlamaModelBranch
     elif arch in bigcode_branch_supported_archs:
         return GPTBigCodeModelBranch
+    elif arch in falcon_archs:
+        return FalconModelBranch
+    elif arch in mistral_archs:
+        return LlamaModelBranch
+
     else:
         all_supported_archs = sum(
             [
@@ -1628,6 +1957,8 @@ def hf_get_branch_class(
                 bloom_branch_supported_archs,
                 llama_branch_supported_archs,
                 bigcode_branch_supported_archs,
+                falcon_archs,
+                mistral_archs,
             ],
             [],
         )
