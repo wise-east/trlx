@@ -34,6 +34,9 @@ from trlx.utils.modeling import (
     gather_dict,
 )
 
+from speechllm.modeling.utils import format_input_for_reward_model
+
+
 logger = logging.get_logger(__name__)
 
 
@@ -328,7 +331,7 @@ class AccelerateRLTrainer(BaseRLTrainer):
             def load_state_hook(models: List[torch.nn.Module], input_dir: str):
                 with self.accelerator.main_process_first():
                     for model in models:
-                        model.from_pretrained(input_dir)
+                        model.from_pretrained(input_dir, trust_remote_code=True)
 
             self.accelerator.register_load_state_pre_hook(load_state_hook)
 
@@ -420,6 +423,8 @@ class AccelerateRLTrainer(BaseRLTrainer):
                 # output lengths
                 output_lengths = torch.tensor([len(out) for out, prompt in zip(str_outputs, str_prompts)], dtype=torch.float)
                 stats["eval/output_length"] = torch.as_tensor(output_lengths).mean().item()
+
+                str_prompts = [format_input_for_reward_model(prompt) for prompt in str_prompts]
 
                 columns = ["prompt", "output", "length"]
                 columns_data = [str_prompts, str_outputs, output_lengths]

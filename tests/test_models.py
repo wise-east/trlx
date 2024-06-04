@@ -26,8 +26,9 @@ from trlx.models.modeling_ppo import (
 )
 from trlx.trainer.accelerate_ilql_trainer import make_experience
 
-AUTO_CAUSAL_LM_PATHS = ["gpt2", "EleutherAI/pythia-160m", "facebook/opt-125m"]
-AUTO_SEQ2SEQ_LM_PATHS = ["t5-small", "google/flan-t5-small"]
+# AUTO_CAUSAL_LM_PATHS = ["gpt2", "EleutherAI/pythia-160m", "facebook/opt-125m"]
+AUTO_CAUSAL_LM_PATHS = ["allenai/OLMo-7B-Instruct", "mistralai/Mistral-7B-Instruct-v0.2", "tiiuae/falcon-7b-instruct"]
+# AUTO_SEQ2SEQ_LM_PATHS = ["t5-small", "google/flan-t5-small"]
 
 
 # Value Head Modeling Tests

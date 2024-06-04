@@ -122,6 +122,7 @@ class AcceleratePPOTrainer(AccelerateRLTrainer):
             num_value_layers_unfrozen=config.method.num_value_layers_unfrozen,
             peft_config=self.config.model.peft_config,
             **self.config.model.model_extra_configs,
+            trust_remote_code=True
         )
 
     def loss(self, batch: PPORLBatch) -> Tuple[float, Dict[str, Any]]:

@@ -15,13 +15,24 @@ from torchtyping import TensorType
 from transformers.modeling_outputs import ModelOutput
 from transformers.models.bloom import modeling_bloom
 from transformers.models.opt import modeling_opt
-from speechllm.replacement_scripts import modeling_falcon
-from transformers.models.mistral import modeling_mistral
-from transformers.modeling_outputs import CausalLMOutputWithPast, CausalLMOutputWithCrossAttentions
-from transformers.cache_utils import Cache, DynamicCache, StaticCache, SlidingWindowCache
+from speechllm.legacy_scripts import modeling_falcon
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from torch.nn import CrossEntropyLoss
 from loguru import logger
+import math
+import importlib
+
+# Check if the 'olmo' package is available
+olmo_spec = importlib.util.find_spec('olmo')
+if olmo_spec is not None:
+    # The 'olmo' package is available, import it
+    from olmo.model import get_causal_attention_bias, should_checkpoint_block, activation_checkpoint_function
+    from olmo.torch_util import ensure_finite_
+else:
+    print("The 'olmo' package is not available. Ignore if not training Olmo.")
+    from transformers.cache_utils import SlidingWindowCache
 
 
 from trlx.data.method_configs import MethodConfig, register_method
@@ -472,6 +483,9 @@ class AutoModelForCausalLMWithHydraValueHead(AutoModelForCausalLMWithValueHead):
         Returns the state dictionary of the model. We add the state dictionary of the value head
         to the state dictionary of the wrapped model by prepending the key with `v_head.`.
         """
+        # drop prefix argument in kwargs 
+        kwargs = {k: v for k, v in kwargs.items() if k != "prefix"}
+
         state_dict = self.v_head.state_dict(*args, **dict(prefix="v_head.", **kwargs))
         if not heads_only:
             state_dict = {
@@ -1087,51 +1101,112 @@ class FalconModelBranch(ModelBranch):
 
 class MistralModelBranch(ModelBranch): 
 
-    def _make_causal_mask(self, input_ids_shape: torch.Size, dtype: torch.dtype, past_key_values_length: int = 0):
-        """
-        Make causal mask used for bi-directional self-attention.
-        """
-        bsz, tgt_len = input_ids_shape
-        mask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min))
-        mask_cond = torch.arange(mask.size(-1))
-        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-        mask = mask.to(dtype)
+    def _update_causal_mask(
+        self,
+        attention_mask: torch.Tensor,
+        input_tensor: torch.Tensor,
+        cache_position: torch.Tensor,
+        past_key_values: Cache,
+        use_cache: bool,
+        output_attentions: bool,
+    ):
+        # TODO: As of torch==2.2.0, the `attention_mask` passed to the model in `generate` is 2D and of dynamic length even when the static
+        # KV cache is used. This is an issue for torch.compile which then recaptures cudagraphs at each decode steps due to the dynamic shapes.
+        # (`recording cudagraph tree for symint key 13`, etc.), which is VERY slow. A workaround is `@torch.compiler.disable`, but this prevents using
+        # `fullgraph=True`. See more context in https://github.com/huggingface/transformers/pull/29114
 
-        if past_key_values_length > 0:
-            mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype), mask], dim=-1)
-        return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+        if self.config._attn_implementation == "flash_attention_2":
+            if attention_mask is not None and use_cache:
+                is_padding_right = attention_mask[:, -1].sum().item() != input_tensor.size()[0]
+                if is_padding_right:
+                    raise ValueError(
+                        "You are attempting to perform batched generation with padding_side='right'"
+                        " this may lead to unexpected behaviour for Flash Attention version of Mistral. Make sure to "
+                        " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
+                    )
+            if attention_mask is not None and 0.0 in attention_mask:
+                return attention_mask
+            return None
 
-    def _expand_mask(self, mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
-        """
-        Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, tgt_seq_len, src_seq_len]`.
-        """
-        bsz, src_len = mask.size()
-        tgt_len = tgt_len if tgt_len is not None else src_len
+        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
+        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
+        # to infer the attention mask.
 
-        expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+        # cache_position must be valid here no matter which cache we use
+        past_seen_tokens = cache_position[0] if past_key_values is not None else 0
+        using_static_cache = isinstance(past_key_values, StaticCache)
+        using_sliding_window_cache = isinstance(past_key_values, SlidingWindowCache)
 
-        inverted_mask = 1.0 - expanded_mask
+        if (
+            self.config._attn_implementation == "sdpa"
+            and not (using_static_cache or using_sliding_window_cache)
+            and not output_attentions
+        ):
+            if AttentionMaskConverter._ignore_causal_mask_sdpa(
+                attention_mask,
+                inputs_embeds=input_tensor,
+                past_key_values_length=past_seen_tokens,
+                sliding_window=self.config.sliding_window,
+                is_training=self.training,
+            ):
+                return None
 
-        return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
-
-    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, hidden_states, past_key_values_length):
-        # create causal mask
-        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-        combined_attention_mask = None
-        if input_shape[-1] > 1:
-            combined_attention_mask = self._make_causal_mask(
-                input_shape, hidden_states.dtype, past_key_values_length=past_key_values_length
-            ).to(hidden_states.device)
-
-        if attention_mask is not None:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            expanded_attn_mask = self._expand_mask(attention_mask, hidden_states.dtype, tgt_len=input_shape[-1]).to(
-                hidden_states.device
+        dtype, device = input_tensor.dtype, input_tensor.device
+        min_dtype = torch.finfo(dtype).min
+        sequence_length = input_tensor.shape[1]
+        # SlidingWindowCache
+        if using_sliding_window_cache:
+            target_length = max(sequence_length, self.config.sliding_window)
+        # StaticCache
+        elif using_static_cache:
+            target_length = past_key_values.get_max_length()
+        # DynamicCache or no cache
+        else:
+            target_length = (
+                attention_mask.shape[-1]
+                if isinstance(attention_mask, torch.Tensor)
+                else past_seen_tokens + sequence_length + 1
             )
-            combined_attention_mask = (
-                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+
+        if attention_mask is not None and attention_mask.dim() == 4:
+            # in this case we assume that the mask comes already in inverted form and requires no inversion or slicing
+            if attention_mask.max() != 0:
+                raise ValueError("Custom 4D attention mask should be passed in inverted form with max==0`")
+            causal_mask = attention_mask
+        else:
+            causal_mask = torch.full(
+                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
             )
-        return combined_attention_mask
+            exclude_mask = torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+            if self.config.sliding_window is not None:
+                if not using_sliding_window_cache or sequence_length > self.config.sliding_window:
+                    exclude_mask |= torch.arange(target_length, device=device) <= (
+                        cache_position.reshape(-1, 1) - self.config.sliding_window
+                    )
+            causal_mask *= exclude_mask
+            causal_mask = causal_mask[None, None, :, :].expand(input_tensor.shape[0], 1, -1, -1)
+            if attention_mask is not None:
+                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+                if attention_mask.dim() == 2:
+                    mask_length = attention_mask.shape[-1]
+                    padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+                    padding_mask = padding_mask == 0
+                    causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                        padding_mask, min_dtype
+                    )
+
+        if (
+            self.config._attn_implementation == "sdpa"
+            and attention_mask is not None
+            and attention_mask.device.type == "cuda"
+            and not output_attentions
+        ):
+            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
+            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
+            # Details: https://github.com/pytorch/pytorch/issues/110213
+            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+
+        return causal_mask
 
     # reference: https://github.com/huggingface/transformers/blob/main/src/transformers/models/mistral/modeling_mistral.py
     # _prepare_decoder_attention_mask, _make_causal_mask and _expand_mask are from LlamaModelBranch
@@ -1160,38 +1235,21 @@ class MistralModelBranch(ModelBranch):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        batch_size, seq_length = hidden_states.shape[:2]
-        seq_length_with_past = seq_length
-        past_key_values_length = 0
+        cache_position = None
 
-        if past_key_values is not None:
-            past_key_values_length = past_key_values[0][0].shape[2]
-            seq_length_with_past = seq_length_with_past + past_key_values_length
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device
+            )
 
         if position_ids is None:
-            device = hidden_states.device if hidden_states is not None else encoder_hidden_states.device
-            position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
-            )
-            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-        else:
-            position_ids = position_ids.view(-1, seq_length).long()
+            position_ids = cache_position.unsqueeze(0)
 
-        if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-            )
-            use_cache = False
-
-        # embed positions
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
-            )
-
-        attention_mask =  self._prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), hidden_states, past_key_values_length
+        causal_mask = self._update_causal_mask(
+            attention_mask, hidden_states, cache_position, past_key_values, use_cache, output_attentions
         )
+
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1202,25 +1260,14 @@ class MistralModelBranch(ModelBranch):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                )
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+            )
 
             hidden_states = layer_outputs[0]
 
@@ -1237,7 +1284,6 @@ class MistralModelBranch(ModelBranch):
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
 
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
@@ -1314,7 +1360,7 @@ class LlamaModelBranch(ModelBranch):
         return_dict: Optional[bool] = False,
     ) -> Union[Tuple, CausalLMOutputWithValue]:
         """Reference:
-        https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L491
+        https://github.com/huggingface/transformers/blob/v4.32-release/src/transformers/models/llama/modeling_llama.py
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1914,8 +1960,161 @@ class T5Branch(ModelBranch):
         )
 
 
-# Branch class utils
+class OlmoModelBranch(ModelBranch):
 
+    # reference: https://github.com/allenai/OLMo/blob/v0.3.0/olmo/model.py#L1060
+    def __init__(
+        self,
+        base_model: transformers.PreTrainedModel,
+        *,
+        num_layers_unfrozen: int,
+    ):  
+        super().__init__(base_model, num_layers_unfrozen=num_layers_unfrozen)
+
+        self.activation_checkpointing_strategy = None
+        self._activation_checkpoint_fn = activation_checkpoint_function(self.base_model.config)
+
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        output_shape: torch.Tensor,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = False,
+    ) -> Union[Tuple, CausalLMOutputWithValue]:
+
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else False
+
+        if past_key_values:
+            assert len(past_key_values) == self.config.n_layers
+
+        batch_size, seq_len = hidden_states.size()[:2]
+        if past_key_values is None:
+            past_length = 0
+        else:
+            past_length = past_key_values[0][0].size(-2)
+
+        # Get embeddings of input.
+        # shape: (batch_size, seq_len, d_model)
+        x = hidden_states
+
+        # if not (self.config.alibi or self.config.rope):
+        #     # Get positional embeddings.
+        #     # shape: (1, seq_len)
+        #     pos = torch.arange(past_length, past_length + seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
+        #     # shape: (1, seq_len, d_model)
+        #     pos_emb = self.transformer.wpe(pos)  # type: ignore
+        #     x = pos_emb + x
+
+        # # Add input + positional embeddings and apply dropout.
+        # # shape: (batch_size, seq_len, d_model)
+        # x = self.transformer.emb_drop(x)  # type: ignore
+
+        # Transform the attention mask into what the blocks expect.
+        if attention_mask is not None:
+            # shape: (batch_size, 1, 1, seq_len)
+            attention_mask = attention_mask.to(dtype=torch.float).view(batch_size, -1)[:, None, None, :]
+            attention_mask = (1.0 - attention_mask) * torch.finfo(attention_mask.dtype).min
+
+        attention_bias = None
+        # Merge attention mask with attention bias.
+        if (
+            attention_bias is not None
+            or attention_mask is not None
+            or self.config.alibi
+            # NOTE (epwalsh): we need to initialize the attn bias in order for attn to work properly
+            # with key+value cache. Otherwise `F.scaled_dot_product_attention()` doesn't seem to compute
+            # scores correctly.
+            or past_key_values is not None
+        ):
+            if attention_bias is None and self.config.alibi:
+                attention_bias = get_causal_attention_bias(
+                    self.__cache, past_length + seq_len, x.device
+                ) + self.get_alibi_attention_bias(past_length + seq_len, x.device)
+            elif attention_bias is None:
+                attention_bias = get_causal_attention_bias(self.__cache, past_length + seq_len, x.device)
+            elif attention_bias.dtype in (torch.int8, torch.bool):
+                attention_bias = attention_bias.to(dtype=torch.float)
+                attention_bias.masked_fill_(attention_bias == 0.0, torch.finfo(attention_bias.dtype).min)
+
+            # Transform to the right shape and data type.
+            mask_len = seq_len
+            if attention_mask is not None:
+                mask_len = attention_mask.shape[-1]
+            elif past_key_values is not None:
+                mask_len = past_key_values[0][0].shape[-2] + seq_len
+            attention_bias = attention_bias[:, :, :mask_len, :mask_len].to(dtype=torch.float)
+
+            # Add in the masking bias.
+            if attention_mask is not None:
+                attention_bias = attention_bias + attention_mask
+                # Might get -infs after adding attention mask, since dtype.min + dtype.min = -inf.
+                # `F.scaled_dot_product_attention()` doesn't handle -inf like you'd expect, instead
+                # it can produce NaNs.
+                ensure_finite_(attention_bias, check_neg_inf=True, check_pos_inf=False)
+
+        attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
+
+        # decoder layers
+        all_hidden_states = []
+        all_self_attns = () if output_attentions else None
+
+        # Apply blocks one-by-one.
+        for block_idx, block in enumerate(self.decoder_blocks):
+            if output_hidden_states:
+                # add hidden states
+                all_hidden_states.append(x)
+
+            layer_past = None if past_key_values is None else past_key_values[block_idx]
+            if should_checkpoint_block(self.activation_checkpointing_strategy, block_idx):
+                # shape: (batch_size, seq_len, d_model)
+                x, cache = self._activation_checkpoint_fn(
+                    block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
+                )
+            else:
+                # shape: (batch_size, seq_len, d_model)
+                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
+
+            if attn_key_values is not None:
+                assert cache is not None
+                attn_key_values.append(cache)
+
+
+        # Apply final layer norm.
+        # shape: (batch_size, seq_len or 1, d_model)
+        x = self.final_norm(x)  # type: ignore
+        if output_hidden_states:
+            # add final hidden state post-final-layernorm, following HuggingFace's convention
+            all_hidden_states.append(x)
+
+        # Get logits.
+        # shape: (batch_size, seq_len or 1, vocab_size)
+        lm_logits = self.lm_head(x)  # type: ignore
+        if self.config.scale_logits:
+            lm_logits.mul_(1 / math.sqrt(self.config.d_model)) 
+
+        next_cache = next_decoder_cache if use_cache else None
+
+        if not return_dict:
+            outputs = (lm_logits,) + (None,) + (None,)
+            return outputs
+
+        return CausalLMOutputWithValue(
+            logits=lm_logits,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+# Branch class utils
 
 def hf_get_branch_class(
     config: transformers.PretrainedConfig,
@@ -1933,6 +2132,7 @@ def hf_get_branch_class(
     bigcode_branch_supported_archs = ["GPTBigCodeModel", "GPTBigCodeForCausalLM"]
     falcon_archs = ["RWForCausalLM", "FalconForCausalLM"]
     mistral_archs = ["MistralForCausalLM"]
+    olmo_archs = ["OLMoForCausalLM"]
     arch = config.architectures[0]
     if arch in gpt_branch_supported_archs:
         return GPTModelBranch
@@ -1947,8 +2147,9 @@ def hf_get_branch_class(
     elif arch in falcon_archs:
         return FalconModelBranch
     elif arch in mistral_archs:
-        return LlamaModelBranch
-
+        return MistralModelBranch
+    elif arch in olmo_archs:
+        return OlmoModelBranch
     else:
         all_supported_archs = sum(
             [
